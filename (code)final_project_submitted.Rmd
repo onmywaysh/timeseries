@@ -1,0 +1,201 @@
+---
+title: "6510 Project"
+author: "Tianle Zhong, Kai Sun"
+date: "2024-11-28"
+output: pdf_document
+---
+
+```{r,message=FALSE}
+library(readxl)
+library(lubridate)
+library(fpp3)
+power <- read_excel("powerconsumption.xlsx")
+head(power)
+
+#convert the Datetime column to a proper date-time format
+power <- power %>%
+  mutate(Datetime = mdy_hm(Datetime)) %>% 
+  as_tsibble(index = Datetime) 
+
+#check the missing values
+colSums(is.na(power))
+```
+
+```{r}
+#explore the data
+power %>% autoplot(PowerConsumption_Zone1)+
+  labs(title = "Zone 1 Power Consumption in Tétouan", y = "Power Consumption")
+
+#decomposition
+dcmp <- power %>%
+  model(stl = STL(PowerConsumption_Zone1))
+components(dcmp) %>% autoplot()
+
+## visualize the relationship between power consumption and weather variables
+power %>%
+  pivot_longer(c(PowerConsumption_Zone1, Temperature, Humidity, WindSpeed, GeneralDiffuseFlows, DiffuseFlows)) %>%
+  mutate(name = factor(name, levels = c("DiffuseFlows", "GeneralDiffuseFlows", "Humidity", "Temperature", "WindSpeed", "PowerConsumption_Zone1"))) %>%
+  ggplot(aes(x = Datetime, y = value, color=name)) + geom_line() +
+  facet_grid(name ~ ., scales = "free_y") + ylab("")+
+  labs(y = "", color = "Variable") +  
+  ggtitle("Plot of Power Consumption and Weather Variables")
+
+```
+
+```{r}
+#Due to the computational runtime, we have decided to focus only on the data from the last week
+power <- power %>%
+  filter(Datetime>=as.POSIXct("2017-12-24 00:00:00", tz = "Africa/Casablanca"))
+train <- power %>%
+  filter(Datetime>=as.POSIXct("2017-12-24 00:00:00", tz = "Africa/Casablanca") & 
+           Datetime<=as.POSIXct("2017-12-28 23:59:59", tz = "Africa/Casablanca"))
+test <- power %>%
+  filter(Datetime>=as.POSIXct("2017-12-29 00:00:00", tz = "Africa/Casablanca"))
+```
+
+```{r}
+#fit the benchmark models (mean,naive,snaive)
+benchmark_fit <- train %>%
+  model(
+    Mean = MEAN(PowerConsumption_Zone1),
+    Naive = NAIVE(PowerConsumption_Zone1),
+    Seasonal_Naive = SNAIVE(PowerConsumption_Zone1)
+)
+#forecast
+benchmark_fc <- benchmark_fit %>%
+  forecast(new_data = test)
+#plot the forecasts
+benchmark_fc %>%
+  autoplot(train, level = NULL) +
+  autolayer(test, PowerConsumption_Zone1, colour = "black")+ 
+  labs(y = "Power Consumption",
+       title = "Forecast of Zone 1 Power Consumption")+
+  guides(colour = guide_legend(title = "Forecast"))
+
+#residual check
+aug <- benchmark_fit %>%
+  augment()
+aug %>%
+  features(.innov, ljung_box, lag = 10)
+```
+
+```{r}
+#the data shows daily seasonality
+dcmp2 <- power %>%
+  model(stl = STL(PowerConsumption_Zone1))
+components(dcmp2) %>% autoplot()
+
+#fit a ARIMA model
+fit <- train %>%
+  model(ARIMA(PowerConsumption_Zone1))
+report(fit)
+
+# try some other models by adding the seasonality
+fit <- train %>%
+  model(
+    arima1 = ARIMA(PowerConsumption_Zone1 ~ pdq(2, 1, 1)),
+    arima2 = ARIMA(PowerConsumption_Zone1 ~ pdq(2, 1, 1)+ PDQ(0, 1, 0, period = 144)),
+    arima3 = ARIMA(PowerConsumption_Zone1 ~ pdq(2, 1, 1)+ PDQ(1, 1, 0, period = 144)),
+    arima4 =ARIMA(PowerConsumption_Zone1 ~ pdq(2, 1, 1)+ PDQ(0, 1, 1, period = 144))
+    )
+fit %>%
+  glance() %>%
+  arrange(AICc) %>%
+  select(.model, AICc) #we see that arima3 fails to generate
+
+#use the best arima model
+arima_fit <- train %>%
+  model(ARIMA(PowerConsumption_Zone1 ~ pdq(2, 1, 1)+ PDQ(0, 1, 1, period = 144)))
+
+#forecast
+arima_fc <- arima_fit %>%
+  forecast(new_data = test)
+#plot the forecasts
+arima_fc %>%
+  autoplot(train, level = NULL) +
+  autolayer(test, PowerConsumption_Zone1, colour = "black")+
+  labs(y = "Power Consumption",
+       title = "Forecast of Zone 1 Power Consumption")+
+  guides(colour = guide_legend(title = "Forecast"))
+
+#residual check
+aug3 <- arima_fit %>%
+  augment()
+aug3 %>%
+  features(.innov, ljung_box, lag = 10)
+```
+
+```{r}
+#fit a dynamic regression
+library(forecast)
+data_train <- train[, c("Datetime", "Temperature", "Humidity", "PowerConsumption_Zone1")]
+test_data <- test[, c("Datetime", "Temperature", "Humidity", "PowerConsumption_Zone1")]
+
+# set time series data
+y <- ts(train$PowerConsumption_Zone1, frequency = 144)  
+xreg <- as.matrix(data_train[, c("Temperature", "Humidity")])
+test_xreg_future<-as.matrix(test_data[, c("Temperature", "Humidity")])
+
+arima_fit_test <- auto.arima(y, xreg = xreg)
+# use test data to forecast
+arima_fc_test <- forecast(arima_fit_test, 
+                     xreg =test_xreg_future)
+
+# plot results
+autoplot(ts(power$PowerConsumption_Zone1, frequency = 144), series = " ") +
+  autolayer(arima_fc_test$mean) +
+  labs(
+    y = "Power Consumption",
+    title = "Forecast of Zone 1 Power Consumption"
+  ) +
+  guides(colour = guide_legend(title = "Data"))
+
+#A simple test for Ljung-Box
+residuals<-residuals(arima_fit_test)
+Box.test(residuals, lag = 20, type = "Ljung-Box")
+```
+
+```{r}
+#cross validation for three benchmark methods and ARIMA
+cv_stretch <- train %>%
+  stretch_tsibble(.init = 288, .step = 72) %>%
+  filter(.id!=max(.id))
+cv_fit <- cv_stretch %>%
+  model(
+    Mean = MEAN(PowerConsumption_Zone1),
+    Naive = NAIVE(PowerConsumption_Zone1),
+    Season_naive = SNAIVE(PowerConsumption_Zone1),
+    ARIMA = ARIMA(PowerConsumption_Zone1 ~ pdq(2, 1, 1)+ PDQ(0, 1, 1, period = 144))
+  )
+cv_forecast <- cv_fit %>% forecast(h = "1 day")
+cv_forecast %>% accuracy(train)
+
+#cross validation for dynamic regression
+# define dynamic arima
+arimax_forecast <- function(y, h, xreg_train, xreg_future) {
+  fit <- auto.arima(y, xreg = xreg_train)  
+  summary(fit)
+  fc<-forecast(fit, h = h, xreg = xreg_future)  
+  return(tail(fc$mean, n = 72))  # return the last 72 results 
+}
+
+#start CV
+start_length=288
+i=start_length
+h_value=72
+
+pred_store <- array(NA, dim = c(length(y)))   #array to store the result data
+
+while (i<length(y)) {
+  fc_value=arimax_forecast(y[1:i],h=h_value,xreg[1:i],xreg[(i+1):(i+h_value)])
+  pred_store[(i+1):(i+h_value)]=fc_value
+  i=i+h_value
+}
+
+pred=pred_store[(start_length+1):length(y)]
+actual=y[(start_length+1):length(y)]
+rmse_cv=sqrt(mean((pred - actual)^2))  #calculate RMSE
+
+print(rmse_cv)
+```
+
